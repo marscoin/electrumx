@@ -10,6 +10,7 @@ ElectrumX - Reimplementation of electrum-server
   :Licence: MIT
   :Language: Python (>= 3.7)
   :Original Author: Neil Booth
+  :Marscoin addon: Marscoin Dev Team
 
 This project is a fork of `kyuupichan/electrumx <https://github.com/kyuupichan/electrumx>`_.
 The original author dropped support for Bitcoin, which we intend to keep.
@@ -19,6 +20,8 @@ full node and indexes the blockchain, allowing efficient querying of history of
 arbitrary addresses. The server can be exposed publicly, and joined to the public network
 of servers via peer discovery. As of May 2020, a significant chunk of the public
 Electrum server network runs ElectrumX.
+
+The current fork includes support for the Marscoin network.
 
 Documentation
 =============
