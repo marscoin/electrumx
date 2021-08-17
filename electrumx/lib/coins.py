@@ -1013,6 +1013,28 @@ class Litecoin(Coin):
     ]
 
 
+class Marscoin(Coin):
+    NAME = "Marscoin"
+    SHORTNAME = "MARS"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488b21e")
+    XPRV_VERBYTES = bytes.fromhex("0488ade4")
+    P2PKH_VERBYTE = bytes.fromhex("30")
+    P2SH_VERBYTES = (bytes.fromhex("32"), bytes.fromhex("05"))
+    WIF_BYTE = bytes.fromhex("b0")
+    GENESIS_HASH = ('06e005f86644f15d2e4c62b59a038c79'
+                    '8a3b0816ba58dcc8c91e02ce5a685299')
+    DESERIALIZER = lib_tx.DeserializerSegWit
+    TX_COUNT = 1670815 
+    TX_COUNT_HEIGHT = 1458525 
+    TX_PER_BLOCK = 2 
+    RPC_PORT = 9981 
+    REORG_LIMIT = 800
+    PEERS = [
+        '107.170.70.121 s t',
+        '159.89.186.177 s t',
+    ]
+
 class LitecoinTestnet(Litecoin):
     SHORTNAME = "XLT"
     NET = "testnet"

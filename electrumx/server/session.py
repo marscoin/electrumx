@@ -874,6 +874,7 @@ class SessionBase(RPCSession):
                          f'{self.session_mgr.session_count():,d} total')
         self.session_mgr.add_session(self)
         self.recalc_concurrency()  # must be called after session_mgr.add_session
+        self.logger.info("hey there")
 
     async def notify(self, touched, height_changed):
         pass
@@ -918,6 +919,7 @@ class SessionBase(RPCSession):
         '''Handle an incoming request.  ElectrumX doesn't receive
         notifications from client sessions.
         '''
+        self.logger.info("start of handle request")
         if isinstance(request, Request):
             handler = self.request_handlers.get(request.method)
         else:
@@ -932,6 +934,7 @@ class SessionBase(RPCSession):
                 BAD_REQUEST, f'use server.version to identify client')
 
         self.session_mgr._method_counts[method] += 1
+        self.logger.info("Handler invocation")
         coro = handler_invocation(handler, request)()
         return await coro
 
@@ -952,6 +955,7 @@ class ElectrumX(SessionBase):
         self.set_request_handlers(self.PROTOCOL_MIN)
         self.is_peer = False
         self.cost = 5.0   # Connection cost
+        self.logger.info("Init Electrum Session")
 
     @classmethod
     def protocol_min_max_strings(cls):
@@ -1345,6 +1349,7 @@ class ElectrumX(SessionBase):
         client_name: a string identifying the client
         protocol_version: the protocol version spoken by the client
         '''
+        self.logger.info("version2")
         self.bump_cost(0.5)
         if self.sv_seen:
             raise RPCError(BAD_REQUEST, f'server.version already sent')
