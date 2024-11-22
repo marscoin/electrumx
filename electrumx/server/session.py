@@ -874,7 +874,6 @@ class SessionBase(RPCSession):
                          f'{self.session_mgr.session_count():,d} total')
         self.session_mgr.add_session(self)
         self.recalc_concurrency()  # must be called after session_mgr.add_session
-        self.logger.info("hey there")
 
     async def notify(self, touched, height_changed):
         pass
@@ -919,7 +918,6 @@ class SessionBase(RPCSession):
         '''Handle an incoming request.  ElectrumX doesn't receive
         notifications from client sessions.
         '''
-        self.logger.info("start of handle request")
         if isinstance(request, Request):
             handler = self.request_handlers.get(request.method)
         else:
@@ -934,7 +932,6 @@ class SessionBase(RPCSession):
                 BAD_REQUEST, f'use server.version to identify client')
 
         self.session_mgr._method_counts[method] += 1
-        self.logger.info("Handler invocation")
         coro = handler_invocation(handler, request)()
         return await coro
 
@@ -1393,10 +1390,15 @@ class ElectrumX(SessionBase):
                 # this can crash electrum client (v < 2.8.2) UNION (3.0.0 <= v < 3.3.0)
                 await self.send_notification('blockchain.estimatefee', ())
 
+
     async def transaction_broadcast(self, raw_tx):
         '''Broadcast a raw transaction to the network.
 
         raw_tx: the raw transaction as a hexadecimal string'''
+        if raw_tx is None:
+            self.logger.error("Received None for raw_tx in transaction_broadcast")
+            raise RPCError(BAD_REQUEST, 'No transaction data provided')
+
         self.bump_cost(0.25 + len(raw_tx) / 5000)
         # This returns errors as JSON RPC errors, as is natural
         try:
