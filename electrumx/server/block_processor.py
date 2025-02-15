@@ -603,8 +603,7 @@ class BlockProcessor:
 
     def spend_utxo(self, tx_hash: bytes, tx_idx: int) -> bytes:
         '''Spend a UTXO and return (hashX + tx_num + value_sats).
-        If the UTXO is not in the cache it must be on disk. If not found on disk,
-        attempt to fetch from daemon before raising an error.
+        If the UTXO is not in the cache it must be on disk.
         '''
         # Fast track is it being in the cache
         idx_packed = pack_le_uint32(tx_idx)
@@ -614,9 +613,6 @@ class BlockProcessor:
 
         # Spend it from the DB.
         txnum_padding = bytes(8-TXNUM_LEN)
-
-        # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
-        # Value: hashX
         prefix = b'h' + tx_hash[:COMP_TXID_LEN] + idx_packed
         candidates = {db_key: hashX for db_key, hashX
                     in self.db.utxo_db.iterator(prefix=prefix)}
@@ -628,32 +624,30 @@ class BlockProcessor:
                 tx_num, = unpack_le_uint64(tx_num_packed + txnum_padding)
                 hash, _height = self.db.fs_tx_hash(tx_num)
                 if hash != tx_hash:
-                    assert hash is not None  # Should always be found
+                    assert hash is not None
                     continue
 
-            # Key: b'u' + address_hashX + tx_idx + tx_num
-            # Value: the UTXO value as a 64-bit unsigned integer
             udb_key = b'u' + hashX + hdb_key[-4-TXNUM_LEN:]
             utxo_value_packed = self.db.utxo_db.get(udb_key)
             if utxo_value_packed:
-                # Remove both entries for this UTXO
                 self.db_deletes.append(hdb_key)
                 self.db_deletes.append(udb_key)
                 return hashX + tx_num_packed + utxo_value_packed
 
-        # If we get here, UTXO wasn't found. Let's verify with the daemon
-        # before raising an error
+        # Let the caller handle checking with the daemon if needed
+        return None
+
+    async def verify_missing_utxo(self, tx_hash: bytes, tx_idx: int):
+        '''Verify a missing UTXO against the daemon.'''
         try:
-            # This would need to be awaitable or run in a thread
-            raw_tx = self.daemon.getrawtransaction(hash_to_hex_str(tx_hash), True)
+            raw_tx = await self.daemon.getrawtransaction(hash_to_hex_str(tx_hash), True)
             if raw_tx and tx_idx < len(raw_tx['vout']):
                 self.logger.warning(f'UTXO {hash_to_hex_str(tx_hash)} / {tx_idx:,d} found in daemon '
                                 f'but missing from local DB. This indicates a synchronization issue.')
         except Exception as e:
             self.logger.debug(f'Daemon also cannot find tx {hash_to_hex_str(tx_hash)}: {e}')
 
-        raise ChainError(f'UTXO {hash_to_hex_str(tx_hash)} / {tx_idx:,d} not '
-                        f'found in "h" table')
+        raise ChainError(f'UTXO {hash_to_hex_str(tx_hash)} / {tx_idx:,d} not found in "h" table')
 
     async def _process_prefetched_blocks(self):
         '''Loop forever processing blocks as they arrive.'''
