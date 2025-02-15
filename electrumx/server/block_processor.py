@@ -775,16 +775,29 @@ class LTORBlockProcessor(BlockProcessor):
         spend_utxo = self.spend_utxo
         undo_info_append = undo_info.append
         update_touched = self.touched.update
+        hashXs_by_tx = []
+        append_hashXs = hashXs_by_tx.append
         to_le_uint32 = pack_le_uint32
         to_le_uint64 = pack_le_uint64
 
-        hashXs_by_tx = [set() for _ in txs]
-
-        # Add the new UTXOs
-        for (tx, tx_hash), hashXs in zip(txs, hashXs_by_tx):
-            add_hashXs = hashXs.add
+        for tx, tx_hash in txs:
+            hashXs = []
+            append_hashX = hashXs.append
             tx_numb = to_le_uint64(tx_num)[:TXNUM_LEN]
 
+            # Spend the inputs
+            for txin in tx.inputs:
+                if txin.is_generation():
+                    continue
+                cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                if cache_value is None:
+                    # UTXO not found, raise error with detailed information
+                    raise ChainError(f'UTXO {hash_to_hex_str(txin.prev_hash)} / {txin.prev_idx:,d} not '
+                                f'found in local DB or daemon')
+                undo_info_append(cache_value)
+                append_hashX(cache_value[:HASHX_LEN])
+
+            # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
                 # Ignore unspendable outputs
                 if is_unspendable(txout.pk_script):
@@ -792,25 +805,13 @@ class LTORBlockProcessor(BlockProcessor):
 
                 # Get the hashX
                 hashX = script_hashX(txout.pk_script)
-                add_hashXs(hashX)
+                append_hashX(hashX)
                 put_utxo(tx_hash + to_le_uint32(idx),
-                         hashX + tx_numb + to_le_uint64(txout.value))
-            tx_num += 1
+                        hashX + tx_numb + to_le_uint64(txout.value))
 
-        # Spend the inputs
-        # A separate for-loop here allows any tx ordering in block.
-        for (tx, tx_hash), hashXs in zip(txs, hashXs_by_tx):
-            add_hashXs = hashXs.add
-            for txin in tx.inputs:
-                if txin.is_generation():
-                    continue
-                cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
-                undo_info_append(cache_value)
-                add_hashXs(cache_value[:HASHX_LEN])
-
-        # Update touched set for notifications
-        for hashXs in hashXs_by_tx:
+            append_hashXs(hashXs)
             update_touched(hashXs)
+            tx_num += 1
 
         self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
 
