@@ -790,99 +790,99 @@ class NameIndexBlockProcessor(BlockProcessor):
 class LTORBlockProcessor(BlockProcessor):
 
     def advance_txs(self, txs, is_unspendable):
-    self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
-
-    # Use local vars for speed in the loops
-    undo_info = []
-    tx_num = self.tx_count
-    script_hashX = self.coin.hashX_from_script
-    put_utxo = self.utxo_cache.__setitem__
-    spend_utxo = self.spend_utxo
-    undo_info_append = undo_info.append
-    update_touched = self.touched.update
-    hashXs_by_tx = []
-    append_hashXs = hashXs_by_tx.append
-    to_le_uint32 = pack_le_uint32
-    to_le_uint64 = pack_le_uint64
-
-    for tx, tx_hash in txs:
-        hashXs = []
-        append_hashX = hashXs.append
-        tx_numb = to_le_uint64(tx_num)[:TXNUM_LEN]
-
-        # Spend the inputs
-        for txin in tx.inputs:
-            if txin.is_generation():
-                continue
-            cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
-            if cache_value is None:
-                # UTXO not found, raise error with detailed information
-                raise ChainError(f'UTXO {hash_to_hex_str(txin.prev_hash)} / {txin.prev_idx:,d} not '
-                               f'found in local DB or daemon')
-            undo_info_append(cache_value)
-            append_hashX(cache_value[:HASHX_LEN])
-
-        # Add the new UTXOs
-        for idx, txout in enumerate(tx.outputs):
-            # Ignore unspendable outputs
-            if is_unspendable(txout.pk_script):
-                continue
-
-            # Get the hashX
-            hashX = script_hashX(txout.pk_script)
-            append_hashX(hashX)
-            put_utxo(tx_hash + to_le_uint32(idx),
-                     hashX + tx_numb + to_le_uint64(txout.value))
-
-        append_hashXs(hashXs)
-        update_touched(hashXs)
-        tx_num += 1
-
-    self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
-
-    self.tx_count = tx_num
-    self.db.tx_counts.append(tx_num)
-
-    return undo_info
-
-    def backup_txs(self, txs, is_unspendable):
-        undo_info = self.db.read_undo_info(self.height)
-        if undo_info is None:
-            raise ChainError(
-                f'no undo information found for height {self.height:,d}'
-            )
+        self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
         # Use local vars for speed in the loops
+        undo_info = []
+        tx_num = self.tx_count
+        script_hashX = self.coin.hashX_from_script
         put_utxo = self.utxo_cache.__setitem__
         spend_utxo = self.spend_utxo
-        add_touched = self.touched.add
-        undo_entry_len = HASHX_LEN + TXNUM_LEN + 8
+        undo_info_append = undo_info.append
+        update_touched = self.touched.update
+        hashXs_by_tx = []
+        append_hashXs = hashXs_by_tx.append
+        to_le_uint32 = pack_le_uint32
+        to_le_uint64 = pack_le_uint64
 
-        # Restore coins that had been spent
-        # (may include coins made then spent in this block)
-        n = 0
         for tx, tx_hash in txs:
+            hashXs = []
+            append_hashX = hashXs.append
+            tx_numb = to_le_uint64(tx_num)[:TXNUM_LEN]
+
+            # Spend the inputs
             for txin in tx.inputs:
                 if txin.is_generation():
                     continue
-                undo_item = undo_info[n:n + undo_entry_len]
-                put_utxo(txin.prev_hash + pack_le_uint32(txin.prev_idx), undo_item)
-                add_touched(undo_item[:HASHX_LEN])
-                n += undo_entry_len
+                cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                if cache_value is None:
+                    # UTXO not found, raise error with detailed information
+                    raise ChainError(f'UTXO {hash_to_hex_str(txin.prev_hash)} / {txin.prev_idx:,d} not '
+                                f'found in local DB or daemon')
+                undo_info_append(cache_value)
+                append_hashX(cache_value[:HASHX_LEN])
 
-        assert n == len(undo_info)
-
-        # Remove tx outputs made in this block, by spending them.
-        for tx, tx_hash in txs:
+            # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
-                # Spend the TX outputs.  Be careful with unspendable
-                # outputs - we didn't save those in the first place.
+                # Ignore unspendable outputs
                 if is_unspendable(txout.pk_script):
                     continue
 
                 # Get the hashX
-                cache_value = spend_utxo(tx_hash, idx)
-                hashX = cache_value[:HASHX_LEN]
-                add_touched(hashX)
+                hashX = script_hashX(txout.pk_script)
+                append_hashX(hashX)
+                put_utxo(tx_hash + to_le_uint32(idx),
+                        hashX + tx_numb + to_le_uint64(txout.value))
 
-        self.tx_count -= len(txs)
+            append_hashXs(hashXs)
+            update_touched(hashXs)
+            tx_num += 1
+
+        self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
+
+        self.tx_count = tx_num
+        self.db.tx_counts.append(tx_num)
+
+        return undo_info
+
+        def backup_txs(self, txs, is_unspendable):
+            undo_info = self.db.read_undo_info(self.height)
+            if undo_info is None:
+                raise ChainError(
+                    f'no undo information found for height {self.height:,d}'
+                )
+
+            # Use local vars for speed in the loops
+            put_utxo = self.utxo_cache.__setitem__
+            spend_utxo = self.spend_utxo
+            add_touched = self.touched.add
+            undo_entry_len = HASHX_LEN + TXNUM_LEN + 8
+
+            # Restore coins that had been spent
+            # (may include coins made then spent in this block)
+            n = 0
+            for tx, tx_hash in txs:
+                for txin in tx.inputs:
+                    if txin.is_generation():
+                        continue
+                    undo_item = undo_info[n:n + undo_entry_len]
+                    put_utxo(txin.prev_hash + pack_le_uint32(txin.prev_idx), undo_item)
+                    add_touched(undo_item[:HASHX_LEN])
+                    n += undo_entry_len
+
+            assert n == len(undo_info)
+
+            # Remove tx outputs made in this block, by spending them.
+            for tx, tx_hash in txs:
+                for idx, txout in enumerate(tx.outputs):
+                    # Spend the TX outputs.  Be careful with unspendable
+                    # outputs - we didn't save those in the first place.
+                    if is_unspendable(txout.pk_script):
+                        continue
+
+                    # Get the hashX
+                    cache_value = spend_utxo(tx_hash, idx)
+                    hashX = cache_value[:HASHX_LEN]
+                    add_touched(hashX)
+
+            self.tx_count -= len(txs)
