@@ -635,7 +635,7 @@ class BlockProcessor:
 
         # Try fetching from daemon directly
         try:
-            raw_tx = self.daemon.send_request('getrawtransaction', [hash_to_hex_str(tx_hash), True])
+            raw_tx = self.daemon.getrawtransaction(hash_to_hex_str(tx_hash), True)
             if raw_tx and tx_idx < len(raw_tx['vout']):
                 script_pubkey = raw_tx['vout'][tx_idx]['scriptPubKey']['hex']
                 value_sats = int(float(raw_tx['vout'][tx_idx]['value']) * 100_000_000)
