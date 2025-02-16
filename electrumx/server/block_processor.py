@@ -607,7 +607,7 @@ class BlockProcessor:
         '''
         idx_packed = pack_le_uint32(tx_idx)
         cache_value = self.utxo_cache.pop(tx_hash + idx_packed, None)
-        
+
         if cache_value:
             return cache_value  # ✅ Found in cache
 
@@ -633,30 +633,24 @@ class BlockProcessor:
                 self.db_deletes.append(udb_key)
                 return hashX + tx_num_packed + utxo_value_packed  # ✅ Found in DB
 
-        # 🚨 If missing, fetch from daemon (threaded)
-        def fetch_from_daemon():
-            try:
-                raw_tx = self.daemon.getrawtransaction(hash_to_hex_str(tx_hash), True)
-                if raw_tx and tx_idx < len(raw_tx['vout']):
-                    script_pubkey = raw_tx['vout'][tx_idx]['scriptPubKey']['hex']
-                    value_sats = int(raw_tx['vout'][tx_idx]['value'] * 100_000_000)
-                    hashX = self.coin.hashX_from_script(bytes.fromhex(script_pubkey))
-                    tx_num = self.tx_count
-                    tx_numb = pack_le_uint64(tx_num)[:TXNUM_LEN]
-                    
-                    # Store in cache for future queries
-                    utxo_entry = hashX + tx_numb + pack_le_uint64(value_sats)
-                    self.utxo_cache[tx_hash + idx_packed] = utxo_entry
-                    return utxo_entry  # ✅ Successfully fetched from daemon
-            except Exception as e:
-                self.logger.error(f'Daemon lookup failed for {hash_to_hex_str(tx_hash)}: {e}')
-            return None
-
-        # Run in a separate thread to avoid blocking
-        utxo_entry = run_in_thread(fetch_from_daemon)
-
-        if utxo_entry:
-            return utxo_entry  # ✅ Successfully fetched
+        # Try fetching from daemon directly
+        try:
+            raw_tx = self.daemon.send_request('getrawtransaction', [hash_to_hex_str(tx_hash), True])
+            if raw_tx and tx_idx < len(raw_tx['vout']):
+                script_pubkey = raw_tx['vout'][tx_idx]['scriptPubKey']['hex']
+                value_sats = int(float(raw_tx['vout'][tx_idx]['value']) * 100_000_000)
+                hashX = self.coin.hashX_from_script(bytes.fromhex(script_pubkey))
+                tx_num = self.tx_count
+                tx_numb = pack_le_uint64(tx_num)[:TXNUM_LEN]
+                
+                # Create UTXO entry
+                utxo_entry = hashX + tx_numb + pack_le_uint64(value_sats)
+                self.utxo_cache[tx_hash + idx_packed] = utxo_entry
+                self.logger.info(f'Successfully fetched UTXO from daemon for tx {hash_to_hex_str(tx_hash)}:{tx_idx}')
+                return utxo_entry
+            
+        except Exception as e:
+            self.logger.error(f'Daemon lookup failed for {hash_to_hex_str(tx_hash)}: {e}')
 
         raise ChainError(f'UTXO {hash_to_hex_str(tx_hash)} / {tx_idx:,d} not found in DB or daemon')
 
