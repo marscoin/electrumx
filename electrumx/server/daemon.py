@@ -83,6 +83,29 @@ class Daemon:
 
     def connector(self):
         return None
+    
+
+    def getrawtransaction_sync(self, hex_hash, verbose=False):
+        '''Synchronous version of getrawtransaction using direct HTTP call'''
+        import requests
+        payload = {
+            'method': 'getrawtransaction',
+            'params': [hex_hash, int(verbose)],
+            'id': next(self.id_counter)
+        }
+        try:
+            response = requests.post(self.current_url(), json=payload)
+            result = response.json()
+            if result.get('error'):
+                err = result['error']
+                if err.get('code') == self.WARMING_UP:
+                    raise WarmingUpError
+                raise DaemonError(err)
+            return result['result']
+        except Exception as e:
+            self.logger.error(f'Sync daemon call failed: {e}')
+            raise
+        
 
     def set_url(self, url):
         '''Set the URLS to the given list, and switch to the first one.'''
