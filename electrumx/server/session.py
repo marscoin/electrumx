@@ -1510,7 +1510,55 @@ class ElectrumX(SessionBase):
         if ptuple >= (1, 4, 2):
             handlers['blockchain.scripthash.unsubscribe'] = self.scripthash_unsubscribe
 
+        # Atomic swap order book relay (message relay only, no custody)
+        handlers['atomicswap.get_offers'] = self.atomicswap_get_offers
+        handlers['atomicswap.post_offer'] = self.atomicswap_post_offer
+        handlers['atomicswap.cancel_offer'] = self.atomicswap_cancel_offer
+
         self.request_handlers = handlers
+
+    # ----------------------------------------------------------------
+    # Atomic Swap Order Book Relay
+    #
+    # ElectrumX acts as a bulletin board for swap offers between wallets.
+    # It never touches funds — just stores and forwards JSON messages.
+    # Offers auto-expire based on their expires_at timestamp.
+    # ----------------------------------------------------------------
+
+    # Class-level storage shared across all sessions
+    _atomicswap_offers = {}  # offer_id -> offer_dict
+
+    async def atomicswap_get_offers(self):
+        """Return all active (non-expired) swap offers."""
+        now = time.time()
+        expired = [k for k, v in self._atomicswap_offers.items()
+                   if v.get('expires_at', 0) < now]
+        for k in expired:
+            del self._atomicswap_offers[k]
+        return list(self._atomicswap_offers.values())
+
+    async def atomicswap_post_offer(self, offer):
+        """Post a new swap offer to the relay."""
+        if not isinstance(offer, dict):
+            raise RPCError(BAD_REQUEST, 'offer must be a dict')
+        offer_id = offer.get('offer_id')
+        if not offer_id:
+            raise RPCError(BAD_REQUEST, 'offer must have offer_id')
+        required = ['mars_amount_sat', 'btc_amount_sat', 'maker_pubkey',
+                    'payment_hash160', 'expires_at']
+        for field in required:
+            if field not in offer:
+                raise RPCError(BAD_REQUEST, f'missing field: {field}')
+        self._atomicswap_offers[offer_id] = offer
+        self.logger.info(f'Atomic swap offer posted: {offer_id[:8]}')
+        return True
+
+    async def atomicswap_cancel_offer(self, offer_id):
+        """Cancel/remove a swap offer."""
+        if offer_id in self._atomicswap_offers:
+            del self._atomicswap_offers[offer_id]
+            return True
+        return False
 
 
 class LocalRPC(SessionBase):
