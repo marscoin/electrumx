@@ -1187,11 +1187,13 @@ class ElectrumX(SessionBase):
         history = await self.confirmed_and_unconfirmed_history(hashX)
         have_txids = {h['tx_hash'] for h in history}
 
-        # Query marscoind for UTXOs at this address
+        # Query marscoind for UTXOs at this address.
+        # scantxoutset is not exposed as a Daemon method, so call
+        # the low-level _send_single directly.
         try:
             desc = f'addr({address})'
-            result = await self.daemon_request(
-                'scantxoutset', 'start', [desc])
+            result = await self.session_mgr.daemon._send_single(
+                'scantxoutset', ['start', [desc]])
         except Exception as e:
             self.logger.warning(f'repair: scantxoutset failed: {e}')
             return history  # fallback
