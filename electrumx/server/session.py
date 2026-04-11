@@ -1604,6 +1604,8 @@ class ElectrumX(SessionBase):
         handlers['atomicswap.get_offers'] = self.atomicswap_get_offers
         handlers['atomicswap.post_offer'] = self.atomicswap_post_offer
         handlers['atomicswap.cancel_offer'] = self.atomicswap_cancel_offer
+        handlers['atomicswap.accept_offer'] = self.atomicswap_accept_offer
+        handlers['atomicswap.get_acceptance'] = self.atomicswap_get_acceptance
 
         # Self-healing address repair (Electrum-Mars extension)
         handlers['blockchain.scripthash.repair'] = self.blockchain_scripthash_repair
@@ -1625,6 +1627,7 @@ class ElectrumX(SessionBase):
     # Class-level storage shared across all sessions
     _atomicswap_offers = {}  # offer_id -> offer_dict
     _atomicswap_seen = set()  # offer_ids we've already gossiped
+    _atomicswap_acceptances = {}  # offer_id -> acceptance dict
 
     async def atomicswap_get_offers(self):
         """Return all active (non-expired) swap offers."""
@@ -1672,6 +1675,33 @@ class ElectrumX(SessionBase):
             del self._atomicswap_offers[offer_id]
             return True
         return False
+
+    async def atomicswap_accept_offer(self, offer_id, acceptance):
+        """Taker calls this to notify the maker they accepted an offer.
+
+        Stores the taker's pubkey and BTC HTLC address so the maker's
+        wallet can poll and complete the swap setup.
+
+        acceptance = {
+            'taker_pubkey': hex,
+            'btc_htlc_address': str,
+            'btc_locktime': int,
+            'timestamp': float,
+        }
+        """
+        if not isinstance(acceptance, dict):
+            raise RPCError(BAD_REQUEST, 'acceptance must be a dict')
+        required = ['taker_pubkey', 'btc_htlc_address']
+        for field in required:
+            if field not in acceptance:
+                raise RPCError(BAD_REQUEST, f'missing field: {field}')
+        self._atomicswap_acceptances[offer_id] = acceptance
+        self.logger.info(f'Atomic swap offer accepted: {offer_id[:8]}')
+        return True
+
+    async def atomicswap_get_acceptance(self, offer_id):
+        """Maker polls this to see if their offer was accepted."""
+        return self._atomicswap_acceptances.get(offer_id)
 
     async def _gossip_offer_to_peers(self, offer):
         """Push an offer to all known good peer ElectrumX servers."""
