@@ -1523,10 +1523,15 @@ class ElectrumX(SessionBase):
     # ElectrumX acts as a bulletin board for swap offers between wallets.
     # It never touches funds — just stores and forwards JSON messages.
     # Offers auto-expire based on their expires_at timestamp.
+    #
+    # Gossip: when a new offer is posted, it's pushed to known peer
+    # servers so the order book is eventually consistent across the
+    # network. Each offer has a unique offer_id for dedup.
     # ----------------------------------------------------------------
 
     # Class-level storage shared across all sessions
     _atomicswap_offers = {}  # offer_id -> offer_dict
+    _atomicswap_seen = set()  # offer_ids we've already gossiped
 
     async def atomicswap_get_offers(self):
         """Return all active (non-expired) swap offers."""
@@ -1535,10 +1540,16 @@ class ElectrumX(SessionBase):
                    if v.get('expires_at', 0) < now]
         for k in expired:
             del self._atomicswap_offers[k]
+            self._atomicswap_seen.discard(k)
         return list(self._atomicswap_offers.values())
 
-    async def atomicswap_post_offer(self, offer):
-        """Post a new swap offer to the relay."""
+    async def atomicswap_post_offer(self, offer, _gossip=True):
+        """Post a new swap offer to the relay.
+
+        If _gossip is True (default), the offer is also pushed to
+        peer servers. Peers should call with _gossip=False to prevent
+        infinite propagation loops.
+        """
         if not isinstance(offer, dict):
             raise RPCError(BAD_REQUEST, 'offer must be a dict')
         offer_id = offer.get('offer_id')
@@ -1549,8 +1560,17 @@ class ElectrumX(SessionBase):
         for field in required:
             if field not in offer:
                 raise RPCError(BAD_REQUEST, f'missing field: {field}')
+
+        # Dedup: if we've seen this offer before, don't re-gossip
+        is_new = offer_id not in self._atomicswap_seen
         self._atomicswap_offers[offer_id] = offer
-        self.logger.info(f'Atomic swap offer posted: {offer_id[:8]}')
+        self._atomicswap_seen.add(offer_id)
+        self.logger.info(f'Atomic swap offer posted: {offer_id[:8]} '
+                         f'(gossip={_gossip and is_new})')
+
+        # Gossip to peers (fire and forget)
+        if _gossip and is_new:
+            asyncio.create_task(self._gossip_offer_to_peers(offer))
         return True
 
     async def atomicswap_cancel_offer(self, offer_id):
@@ -1559,6 +1579,64 @@ class ElectrumX(SessionBase):
             del self._atomicswap_offers[offer_id]
             return True
         return False
+
+    async def _gossip_offer_to_peers(self, offer):
+        """Push an offer to all known good peer ElectrumX servers."""
+        try:
+            peer_mgr = getattr(self, 'peer_mgr', None)
+            if peer_mgr is None:
+                return
+            peers = peer_mgr._get_recent_good_peers()
+        except Exception as e:
+            self.logger.debug(f'atomicswap gossip: no peers: {e}')
+            return
+
+        for peer in peers:
+            try:
+                await self._push_offer_to_peer(peer, offer)
+            except Exception as e:
+                self.logger.debug(
+                    f'atomicswap gossip to {peer.host}: {e}')
+
+    async def _push_offer_to_peer(self, peer, offer):
+        """Send a single offer to a specific peer via SSL JSON-RPC."""
+        import ssl as _ssl
+        import json as _json
+        # Find an SSL port
+        port = peer.ssl_port if peer.ssl_port else peer.tcp_port
+        if not port:
+            return
+        use_ssl = peer.ssl_port is not None
+
+        ctx = None
+        if use_ssl:
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(peer.host, port, ssl=ctx),
+            timeout=10)
+        try:
+            # Use _gossip=False to prevent loops
+            req = _json.dumps({
+                'id': 1,
+                'method': 'atomicswap.post_offer',
+                'params': [offer, False],
+            }) + '\n'
+            writer.write(req.encode())
+            await writer.drain()
+            # Read response (best effort)
+            try:
+                await asyncio.wait_for(reader.readline(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 class LocalRPC(SessionBase):
