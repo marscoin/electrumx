@@ -1162,6 +1162,60 @@ class ElectrumX(SessionBase):
         hashX = scripthash_to_hashX(scripthash)
         return await self.confirmed_and_unconfirmed_history(hashX)
 
+    async def blockchain_scripthash_repair(self, scripthash, address):
+        '''Self-healing history repair for a scripthash.
+
+        Cross-references our internal history index against marscoind's
+        actual UTXO set. If marscoind sees transactions for this address
+        that our index is missing (due to a past sync issue), we return
+        the union so the client gets a correct view.
+
+        This is an Electrum-Mars extension RPC — not in standard ElectrumX.
+
+        Args:
+            scripthash: the script hash hex
+            address: the address string (needed for marscoind scantxoutset)
+
+        Returns:
+            List of {tx_hash, height} dicts, same format as
+            blockchain.scripthash.get_history.
+        '''
+        import json as _json
+
+        # Get what we have in our index
+        hashX = scripthash_to_hashX(scripthash)
+        history = await self.confirmed_and_unconfirmed_history(hashX)
+        have_txids = {h['tx_hash'] for h in history}
+
+        # Query marscoind for UTXOs at this address
+        try:
+            desc = f'addr({address})'
+            result = await self.daemon_request(
+                'scantxoutset', 'start', [desc])
+        except Exception as e:
+            self.logger.warning(f'repair: scantxoutset failed: {e}')
+            return history  # fallback
+
+        if not result or not isinstance(result, dict):
+            return history
+
+        unspents = result.get('unspents', [])
+        missing = []
+        for utxo in unspents:
+            txid = utxo.get('txid')
+            height = utxo.get('height', 0)
+            if txid and txid not in have_txids:
+                missing.append({'tx_hash': txid, 'height': height})
+                have_txids.add(txid)
+
+        if missing:
+            self.logger.warning(
+                f'repair: address {address} — index missing {len(missing)} '
+                f'txs that marscoind has. Returning union.')
+            history = history + missing
+
+        return history
+
     async def scripthash_get_mempool(self, scripthash):
         '''Return the mempool transactions touching a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
@@ -1514,6 +1568,9 @@ class ElectrumX(SessionBase):
         handlers['atomicswap.get_offers'] = self.atomicswap_get_offers
         handlers['atomicswap.post_offer'] = self.atomicswap_post_offer
         handlers['atomicswap.cancel_offer'] = self.atomicswap_cancel_offer
+
+        # Self-healing address repair (Electrum-Mars extension)
+        handlers['blockchain.scripthash.repair'] = self.blockchain_scripthash_repair
 
         self.request_handlers = handlers
 
