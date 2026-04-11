@@ -1170,6 +1170,10 @@ class ElectrumX(SessionBase):
         that our index is missing (due to a past sync issue), we return
         the union so the client gets a correct view.
 
+        For repaired entries, we also include the raw tx hex and block
+        header so the client can bypass the broken merkle index and
+        mark the tx as confirmed using a trusted direct path.
+
         This is an Electrum-Mars extension RPC — not in standard ElectrumX.
 
         Args:
@@ -1177,19 +1181,16 @@ class ElectrumX(SessionBase):
             address: the address string (needed for marscoind scantxoutset)
 
         Returns:
-            List of {tx_hash, height} dicts, same format as
-            blockchain.scripthash.get_history.
+            List of entries. Normal entries: {tx_hash, height}.
+            Repaired entries additionally have: tx_hex, block_hash,
+            block_header (80-byte hex), timestamp, txpos.
         '''
-        import json as _json
-
         # Get what we have in our index
         hashX = scripthash_to_hashX(scripthash)
         history = await self.confirmed_and_unconfirmed_history(hashX)
         have_txids = {h['tx_hash'] for h in history}
 
         # Query marscoind for UTXOs at this address.
-        # scantxoutset is not exposed as a Daemon method, so call
-        # the low-level _send_single directly.
         try:
             desc = f'addr({address})'
             result = await self.session_mgr.daemon._send_single(
@@ -1206,9 +1207,42 @@ class ElectrumX(SessionBase):
         for utxo in unspents:
             txid = utxo.get('txid')
             height = utxo.get('height', 0)
-            if txid and txid not in have_txids:
-                missing.append({'tx_hash': txid, 'height': height})
-                have_txids.add(txid)
+            block_hash = utxo.get('blockhash', '')
+            if not txid or txid in have_txids:
+                continue
+            have_txids.add(txid)
+
+            # Enrich the entry with raw tx + block info so the client
+            # can verify without depending on our merkle index.
+            entry = {'tx_hash': txid, 'height': height}
+            try:
+                raw_tx = await self.session_mgr.daemon._send_single(
+                    'getrawtransaction', [txid])
+                entry['tx_hex'] = raw_tx
+            except Exception as e:
+                self.logger.warning(f'repair: getrawtransaction {txid}: {e}')
+
+            if block_hash:
+                try:
+                    block_info = await self.session_mgr.daemon._send_single(
+                        'getblockheader', [block_hash])
+                    # Build the 80-byte block header hex so the client can
+                    # verify it against its own header chain
+                    entry['block_hash'] = block_hash
+                    entry['timestamp'] = block_info.get('time', 0)
+                    # Find position of tx in the block
+                    try:
+                        block = await self.session_mgr.daemon._send_single(
+                            'getblock', [block_hash, 1])
+                        txs = block.get('tx', [])
+                        if txid in txs:
+                            entry['txpos'] = txs.index(txid)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.logger.warning(f'repair: getblockheader {block_hash}: {e}')
+
+            missing.append(entry)
 
         if missing:
             self.logger.warning(
