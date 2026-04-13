@@ -196,8 +196,26 @@ class Coin:
     def pay_to_address_script(cls, address):
         '''Return a pubkey script that pays to a pubkey hash.
 
-        Pass the address (either P2PKH or P2SH) in base58 form.
+        Supports base58 (P2PKH, P2SH) and bech32/bech32m segwit
+        addresses (P2WPKH, P2WSH, taproot) when SEGWIT_HRP is set.
         '''
+        # Try bech32 segwit first if the coin defines a SEGWIT_HRP
+        hrp = getattr(cls, 'SEGWIT_HRP', None)
+        if hrp and address.lower().startswith(hrp + '1'):
+            from .segwit_addr import decode_segwit_address
+            witver, witprog = decode_segwit_address(hrp, address)
+            if witprog is not None:
+                witprog_bytes = bytes(witprog)
+                if witver == 0 and len(witprog_bytes) == 20:
+                    return ScriptPubKey.P2WPKH_script(witprog_bytes)
+                elif witver == 0 and len(witprog_bytes) == 32:
+                    return ScriptPubKey.P2WSH_script(witprog_bytes)
+                elif witver >= 1:
+                    # Taproot / future witness versions
+                    return bytes([0x50 + witver, len(witprog_bytes)]) + witprog_bytes
+            raise CoinError(f'invalid segwit address: {address}')
+
+        # Fall back to base58
         raw = cls.DECODE_CHECK(address)
 
         # Require version byte(s) plus hash160.
@@ -1017,6 +1035,7 @@ class Marscoin(Coin):
     NAME = "Marscoin"
     SHORTNAME = "MARS"
     NET = "mainnet"
+    SEGWIT_HRP = "mars"
     XPUB_VERBYTES = bytes.fromhex("0488b21e")
     XPRV_VERBYTES = bytes.fromhex("0488ade4")
     P2PKH_VERBYTE = bytes.fromhex("30")

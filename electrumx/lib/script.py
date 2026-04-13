@@ -117,6 +117,16 @@ class ScriptPubKey:
                 + Script.push_data(hash160)
                 + bytes((OpCodes.OP_EQUALVERIFY, OpCodes.OP_CHECKSIG)))
 
+    @classmethod
+    def P2WPKH_script(cls, hash160):
+        '''OP_0 <20-byte-hash> — Pay to Witness Public Key Hash.'''
+        return bytes([0x00, 0x14]) + hash160
+
+    @classmethod
+    def P2WSH_script(cls, sha256_hash):
+        '''OP_0 <32-byte-hash> — Pay to Witness Script Hash.'''
+        return bytes([0x00, 0x20]) + sha256_hash
+
 
 class Script:
 
