@@ -1031,7 +1031,7 @@ class Litecoin(Coin):
     ]
 
 
-class Marscoin(Coin):
+class Marscoin(AuxPowMixin, Coin):
     NAME = "Marscoin"
     SHORTNAME = "MARS"
     NET = "mainnet"
@@ -1043,7 +1043,7 @@ class Marscoin(Coin):
     WIF_BYTE = bytes.fromhex("b0")
     GENESIS_HASH = ('06e005f86644f15d2e4c62b59a038c79'
                     '8a3b0816ba58dcc8c91e02ce5a685299')
-    DESERIALIZER = lib_tx.DeserializerSegWit
+    DESERIALIZER = lib_tx.DeserializerAuxPowSegWit
     TX_COUNT = 1670815 
     TX_COUNT_HEIGHT = 1458525 
     TX_PER_BLOCK = 2 
