@@ -34,6 +34,7 @@ from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
                                 hex_str_to_hash, sha256)
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
+from electrumx.server.atomicswap import SwapRelay, SwapRelayError
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
 
@@ -1606,6 +1607,7 @@ class ElectrumX(SessionBase):
         handlers['atomicswap.cancel_offer'] = self.atomicswap_cancel_offer
         handlers['atomicswap.accept_offer'] = self.atomicswap_accept_offer
         handlers['atomicswap.get_acceptance'] = self.atomicswap_get_acceptance
+        handlers['atomicswap.report_abandoned'] = self.atomicswap_report_abandoned
 
         # Self-healing address repair (Electrum-Mars extension)
         handlers['blockchain.scripthash.repair'] = self.blockchain_scripthash_repair
@@ -1624,27 +1626,30 @@ class ElectrumX(SessionBase):
     # network. Each offer has a unique offer_id for dedup.
     # ----------------------------------------------------------------
 
-    # Class-level storage shared across all sessions
-    _atomicswap_offers = {}  # offer_id -> offer_dict
-    _atomicswap_seen = set()  # offer_ids we've already gossiped
-    _atomicswap_acceptances = {}  # offer_id -> acceptance dict
+    # One relay shared by all sessions. State and abuse controls live in
+    # electrumx/server/atomicswap.py so they can be tested without a server.
+    _atomicswap_relay = None
+
+    @staticmethod
+    def _swap_relay():
+        if ElectrumX._atomicswap_relay is None:
+            ElectrumX._atomicswap_relay = SwapRelay.from_env()
+        return ElectrumX._atomicswap_relay
+
+    def _swap_client(self):
+        return str(self.remote_address().host)
 
     async def atomicswap_get_offers(self):
         """Return all active (non-expired) swap offers."""
-        now = time.time()
-        expired = [k for k, v in self._atomicswap_offers.items()
-                   if v.get('expires_at', 0) < now]
-        for k in expired:
-            del self._atomicswap_offers[k]
-            self._atomicswap_seen.discard(k)
-        return list(self._atomicswap_offers.values())
+        return self._swap_relay().get_offers()
 
     async def atomicswap_post_offer(self, offer, _gossip=True):
         """Post a new swap offer to the relay.
 
         If _gossip is True (default), the offer is also pushed to
-        peer servers. Peers should call with _gossip=False to prevent
-        infinite propagation loops.
+        peer servers. Peers call with _gossip=False to prevent
+        infinite propagation loops; those relayed copies never
+        overwrite an existing offer.
         """
         if not isinstance(offer, dict):
             raise RPCError(BAD_REQUEST, 'offer must be a dict')
@@ -1657,10 +1662,8 @@ class ElectrumX(SessionBase):
             if field not in offer:
                 raise RPCError(BAD_REQUEST, f'missing field: {field}')
 
-        # Dedup: if we've seen this offer before, don't re-gossip
-        is_new = offer_id not in self._atomicswap_seen
-        self._atomicswap_offers[offer_id] = offer
-        self._atomicswap_seen.add(offer_id)
+        is_new = self._swap_relay().post_offer(
+            offer, self._swap_client(), from_peer=not _gossip)
         self.logger.info(f'Atomic swap offer posted: {offer_id[:8]} '
                          f'(gossip={_gossip and is_new})')
 
@@ -1670,17 +1673,18 @@ class ElectrumX(SessionBase):
         return True
 
     async def atomicswap_cancel_offer(self, offer_id):
-        """Cancel/remove a swap offer."""
-        if offer_id in self._atomicswap_offers:
-            del self._atomicswap_offers[offer_id]
-            return True
-        return False
+        """Cancel/remove a swap offer. Only its poster may do this."""
+        try:
+            return self._swap_relay().cancel_offer(offer_id, self._swap_client())
+        except SwapRelayError as e:
+            raise RPCError(BAD_REQUEST, str(e))
 
     async def atomicswap_accept_offer(self, offer_id, acceptance):
         """Taker calls this to notify the maker they accepted an offer.
 
         Stores the taker's pubkey and BTC HTLC address so the maker's
-        wallet can poll and complete the swap setup.
+        wallet can poll and complete the swap setup. The first taker
+        wins; per-client limits apply (see atomicswap.py).
 
         acceptance = {
             'taker_pubkey': hex,
@@ -1695,13 +1699,35 @@ class ElectrumX(SessionBase):
         for field in required:
             if field not in acceptance:
                 raise RPCError(BAD_REQUEST, f'missing field: {field}')
-        self._atomicswap_acceptances[offer_id] = acceptance
+        try:
+            self._swap_relay().accept_offer(offer_id, acceptance, self._swap_client())
+        except SwapRelayError as e:
+            self.logger.info(f'Atomic swap accept refused for {offer_id[:8]}: {e}')
+            raise RPCError(BAD_REQUEST, str(e))
         self.logger.info(f'Atomic swap offer accepted: {offer_id[:8]}')
         return True
 
     async def atomicswap_get_acceptance(self, offer_id):
-        """Maker polls this to see if their offer was accepted."""
-        return self._atomicswap_acceptances.get(offer_id)
+        """Maker polls this to see if their offer was accepted.
+
+        The result includes 'taker_tag', an anonymous per-connection
+        identifier the maker can use for its own limits.
+        """
+        return self._swap_relay().get_acceptance(offer_id)
+
+    async def atomicswap_report_abandoned(self, offer_id):
+        """Maker reports that the taker never funded the BTC lockbox.
+
+        The taker's connection is then blocked from accepting offers for
+        ATOMICSWAP_BLOCK_HOURS. Only the offer's poster may report it.
+        """
+        try:
+            result = self._swap_relay().report_abandoned(offer_id, self._swap_client())
+        except SwapRelayError as e:
+            raise RPCError(BAD_REQUEST, str(e))
+        if result:
+            self.logger.info(f'Atomic swap acceptance abandoned: {offer_id[:8]}')
+        return result
 
     async def _gossip_offer_to_peers(self, offer):
         """Push an offer to all known good peer ElectrumX servers."""
