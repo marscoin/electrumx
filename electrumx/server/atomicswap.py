@@ -11,9 +11,11 @@ Abuse controls (no wallet changes needed):
   replace or cancel it. Copies relayed from peer servers never overwrite
   an existing offer and can't be claimed by a client.
 * First accept wins. A second taker gets "offer already taken".
-* Each client may have one open acceptance at a time and a few per day.
-* The maker can report an acceptance that never became a funded BTC
-  lockbox. The taker is then blocked from accepting for a while.
+* Each client may have one open acceptance (on a live offer) at a time
+  and a few per day.
+* Acceptances outlive their offer for a day, so a maker that polls late
+  still sees it, and can later report an acceptance that never became a
+  funded BTC lockbox. The taker is then blocked from accepting for a while.
 
 Clients are identified by a "tag": a keyed hash of their IP address
 (IPv6 by /64, because addresses within a /64 are trivial to rotate).
@@ -55,7 +57,8 @@ class SwapRelay:
         self.offers = {}        # offer_id -> offer dict
         self.owner = {}         # offer_id -> poster tag, or None if relayed by a peer
         self.seen = set()       # offer_ids already gossiped
-        self.acceptances = {}   # offer_id -> acceptance dict
+        self.acceptances = {}   # offer_id -> acceptance dict (kept for a day)
+        self.accept_owner = {}  # offer_id -> poster tag at the time of acceptance
         self.accept_times = {}  # tag -> timestamps of accepts in the last day
         self.blocked_until = {}  # tag -> timestamp
 
@@ -95,8 +98,10 @@ class SwapRelay:
             del self.offers[offer_id]
             self.owner.pop(offer_id, None)
             self.seen.discard(offer_id)
-        for offer_id in [k for k in self.acceptances if k not in self.offers]:
+        for offer_id in [k for k, v in self.acceptances.items()
+                         if v['accepted_at'] <= now - DAY]:
             del self.acceptances[offer_id]
+            self.accept_owner.pop(offer_id, None)
         for tag in list(self.accept_times):
             recent = [t for t in self.accept_times[tag] if t > now - DAY]
             if recent:
@@ -137,6 +142,7 @@ class SwapRelay:
         del self.offers[offer_id]
         self.owner.pop(offer_id, None)
         self.acceptances.pop(offer_id, None)
+        self.accept_owner.pop(offer_id, None)
         return True
 
     # ------------------------------------------------------------ acceptances
@@ -159,7 +165,8 @@ class SwapRelay:
         if self.blocked_until.get(tag, 0) > now:
             raise SwapRelayError('too many abandoned swaps from this connection; '
                                  'try again later')
-        open_count = sum(1 for a in self.acceptances.values() if a['taker_tag'] == tag)
+        open_count = sum(1 for k, a in self.acceptances.items()
+                         if a['taker_tag'] == tag and k in self.offers)
         if open_count >= self.max_open_per_tag:
             raise SwapRelayError('you already have a swap in progress; '
                                  'finish it before accepting another')
@@ -169,6 +176,7 @@ class SwapRelay:
         record['taker_tag'] = tag
         record['accepted_at'] = now
         self.acceptances[offer_id] = record
+        self.accept_owner[offer_id] = self.owner.get(offer_id)
         self.accept_times.setdefault(tag, []).append(now)
         return True
 
@@ -177,14 +185,15 @@ class SwapRelay:
         return self.acceptances.get(offer_id)
 
     def report_abandoned(self, offer_id, host):
-        '''The maker reports that the taker never funded the BTC lockbox.'''
+        '''The maker reports that the taker never funded the BTC lockbox.
+        Works until the acceptance record expires, a day after acceptance.'''
         self._prune()
-        if offer_id not in self.offers:
-            raise SwapRelayError('unknown or expired offer')
-        if self.owner.get(offer_id) != self.tag(host):
-            raise SwapRelayError('only the client that posted an offer can report it')
-        acceptance = self.acceptances.pop(offer_id, None)
-        if acceptance is None:
+        if offer_id not in self.acceptances:
             return False
+        owner = self.accept_owner.get(offer_id)
+        if owner is None or owner != self.tag(host):
+            raise SwapRelayError('only the client that posted an offer can report it')
+        acceptance = self.acceptances.pop(offer_id)
+        self.accept_owner.pop(offer_id, None)
         self.blocked_until[acceptance['taker_tag']] = self.clock() + self.strike_seconds
         return True

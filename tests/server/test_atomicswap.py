@@ -156,6 +156,26 @@ def test_open_slot_frees_when_offer_ends(relay):
     relay.accept_offer('o2', acceptance(), TAKER)
 
 
+def test_open_slot_frees_when_offer_expires(relay, clock):
+    relay.post_offer(offer('o1', expires_in=60), MAKER)
+    relay.accept_offer('o1', acceptance(), TAKER)
+    clock.now += 61
+    relay.post_offer(offer('o2', now=clock.now), MAKER)
+    assert relay.accept_offer('o2', acceptance(), TAKER) is True
+
+
+def test_acceptance_outlives_its_offer(relay, clock):
+    # The maker polls every 30 s; an acceptance made just before the offer
+    # expires must still reach it.
+    relay.post_offer(offer(expires_in=60), MAKER)
+    relay.accept_offer('o1', acceptance(), TAKER)
+    clock.now += 61
+    assert relay.get_offers() == []
+    assert relay.get_acceptance('o1')['taker_pubkey'] == acceptance()['taker_pubkey']
+    clock.now += DAY
+    assert relay.get_acceptance('o1') is None
+
+
 def test_daily_limit(relay, clock):
     for i in range(3):
         relay.post_offer(offer(f'o{i}'), MAKER)
@@ -185,6 +205,26 @@ def test_report_abandoned_blocks_taker(relay, clock):
     clock.now += 24 * 3600 + 1
     relay.post_offer(offer('o3', now=clock.now), MAKER)
     assert relay.accept_offer('o3', acceptance(), TAKER) is True
+
+
+def test_report_after_offer_expired(relay, clock):
+    # Makers notice abandonment hours later, long after the 15-minute offer.
+    relay.post_offer(offer(expires_in=900), MAKER)
+    relay.accept_offer('o1', acceptance(), TAKER)
+    clock.now += 8 * 3600
+    with pytest.raises(SwapRelayError, match='only the client'):
+        relay.report_abandoned('o1', OTHER)
+    assert relay.report_abandoned('o1', MAKER) is True
+    relay.post_offer(offer('o2', now=clock.now), MAKER)
+    with pytest.raises(SwapRelayError, match='abandoned'):
+        relay.accept_offer('o2', acceptance(), TAKER)
+
+
+def test_relayed_offer_acceptance_cannot_be_reported(relay):
+    relay.post_offer(offer(), MAKER, from_peer=True)
+    relay.accept_offer('o1', acceptance(), TAKER)
+    with pytest.raises(SwapRelayError, match='only the client'):
+        relay.report_abandoned('o1', MAKER)
 
 
 def test_only_poster_can_report(relay):
