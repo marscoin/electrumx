@@ -407,6 +407,52 @@ raise them.
   request, in order to avoid disconnection.
 
 
+Atomic Swap Watchtower
+======================
+
+The watchtower finishes atomic swaps for wallets that go offline: it
+claims MARS once the swap secret appears on the Bitcoin chain, or posts
+the wallet's pre-signed BTC refund after the timelock.  It holds no keys.
+It needs outbound HTTPS to the Esplora services below and uses the
+relay's client tags (see ``ATOMICSWAP_TAG_SECRET``) for its limits.
+
+.. envvar:: WATCHTOWER_ENABLED
+
+  Set to ``0`` to turn the watchtower off.  The default is on.
+
+.. envvar:: WATCHTOWER_DB
+
+  Path of the SQLite file holding registered watches.  Defaults to
+  ``watchtower.sqlite`` in :envvar:`DB_DIRECTORY`.  Keep it across
+  restarts and upgrades: a lost watch can cost a user money.
+
+.. envvar:: WATCHTOWER_ESPLORA_URLS
+
+  Comma-separated Esplora API base URLs.  Defaults to
+  ``https://mempool.space/api,https://blockstream.info/api``.
+
+.. envvar:: WATCHTOWER_INTERVAL
+
+  Seconds between checks.  Defaults to 60.
+
+.. envvar:: WATCHTOWER_MAX_ACTIVE_PER_CLIENT
+
+  Watches one client may have in progress.  Defaults to 3.
+
+.. envvar:: WATCHTOWER_MAX_REGISTRATIONS_PER_DAY
+
+  Registrations one client may make per day.  Defaults to 12.
+
+.. envvar:: WATCHTOWER_MAX_ACTIVE
+
+  Watches in progress across all clients.  Defaults to 2000.
+
+.. envvar:: WATCHTOWER_STRICT_FUNDING
+
+  Set to ``1`` to refuse a registration when the daemon does not know
+  the MARS funding transaction.  By default that case is accepted
+  (a funding output that exists but does not match is always refused).
+
 Peer Discovery
 ==============
 
