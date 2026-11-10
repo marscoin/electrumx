@@ -34,8 +34,12 @@ from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
                                 hex_str_to_hash, sha256)
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
+from electrumx.server.atomicswap import SwapRelay, SwapRelayError
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
+from electrumx.server.watchtower import (PROTOCOL_VERSION as WATCHTOWER_VERSION,
+                                         Watchtower, WatchtowerError)
+from electrumx.server.watchtower import enabled_from_env as watchtower_enabled
 
 if TYPE_CHECKING:
     from electrumx.server.db import DB
@@ -163,6 +167,8 @@ class SessionManager:
         # Event triggered when electrumx is listening for incoming requests.
         self.server_listening = Event()
         self.session_event = Event()
+        # Atomic swap watchtower; created in serve() if enabled
+        self.watchtower = None
 
         # Set up the RPC request handlers
         cmds = ('add_peer daemon_url disconnect getinfo groups log peers '
@@ -632,7 +638,10 @@ class SessionManager:
             await self._start_external_servers()
             # Peer discovery should start after the external servers
             # because we connect to ourself
+            self._start_watchtower()
             async with self._task_group as group:
+                if self.watchtower is not None:
+                    await group.spawn(self.watchtower.run())
                 await group.spawn(self.peer_mgr.discover_peers())
                 await group.spawn(self._clear_stale_sessions())
                 await group.spawn(self._handle_chain_reorgs())
@@ -750,6 +759,45 @@ class SessionManager:
         hex_hash = await self.daemon.broadcast_transaction(raw_tx)
         self.txs_sent += 1
         return hex_hash
+
+    # --- Atomic swap watchtower (see electrumx/server/watchtower.py)
+
+    def _start_watchtower(self):
+        '''Open the watchtower and its stored watches. A failure here must
+        not stop the server; the watchtower is then simply unavailable.'''
+        if not watchtower_enabled():
+            self.logger.info('atomic swap watchtower disabled (WATCHTOWER_ENABLED)')
+            return
+        try:
+            self.watchtower = Watchtower.from_env(
+                self.env.db_dir,
+                broadcast_mars=self.broadcast_transaction,
+                mars_raw_tx=self._watchtower_raw_tx,
+                mars_confirmations=self._watchtower_confirmations,
+                mars_height=lambda: self.db.db_height,
+                logger=self.logger,
+            )
+        except Exception:
+            self.logger.exception('atomic swap watchtower could not start')
+            return
+        self.logger.info(f'atomic swap watchtower state: {self.watchtower.store.path}')
+
+    async def _watchtower_raw_tx(self, tx_hash):
+        '''Raw tx hex from the daemon, or None if it does not know the tx.'''
+        try:
+            return await self.daemon.getrawtransaction(tx_hash, False)
+        except DaemonError as e:
+            error = e.args[0] if e.args else None
+            if isinstance(error, dict) and error.get('code') == -5:
+                return None
+            raise
+
+    async def _watchtower_confirmations(self, tx_hash):
+        try:
+            tx = await self.daemon.getrawtransaction(tx_hash, True)
+        except DaemonError:
+            return 0
+        return int(tx.get('confirmations') or 0) if isinstance(tx, dict) else 0
 
     async def limited_history(self, hashX):
         '''Returns a pair (history, cost).
@@ -978,6 +1026,16 @@ class ElectrumX(SessionBase):
             'genesis_hash': env.coin.GENESIS_HASH,
             'hash_function': 'sha256',
             'services': [str(service) for service in env.report_services],
+            'atomicswap': cls.atomicswap_capabilities(),
+        }
+
+    @staticmethod
+    def atomicswap_capabilities():
+        '''What this server's atomic swap relay supports.'''
+        return {
+            'abuse_controls': True,
+            'watchtower': watchtower_enabled(),
+            'watchtower_version': WATCHTOWER_VERSION,
         }
 
     async def server_features_async(self):
@@ -1606,6 +1664,10 @@ class ElectrumX(SessionBase):
         handlers['atomicswap.cancel_offer'] = self.atomicswap_cancel_offer
         handlers['atomicswap.accept_offer'] = self.atomicswap_accept_offer
         handlers['atomicswap.get_acceptance'] = self.atomicswap_get_acceptance
+        handlers['atomicswap.report_abandoned'] = self.atomicswap_report_abandoned
+        handlers['atomicswap.features'] = self.atomicswap_features
+        handlers['atomicswap.watch_register'] = self.atomicswap_watch_register
+        handlers['atomicswap.watch_status'] = self.atomicswap_watch_status
 
         # Self-healing address repair (Electrum-Mars extension)
         handlers['blockchain.scripthash.repair'] = self.blockchain_scripthash_repair
@@ -1624,27 +1686,30 @@ class ElectrumX(SessionBase):
     # network. Each offer has a unique offer_id for dedup.
     # ----------------------------------------------------------------
 
-    # Class-level storage shared across all sessions
-    _atomicswap_offers = {}  # offer_id -> offer_dict
-    _atomicswap_seen = set()  # offer_ids we've already gossiped
-    _atomicswap_acceptances = {}  # offer_id -> acceptance dict
+    # One relay shared by all sessions. State and abuse controls live in
+    # electrumx/server/atomicswap.py so they can be tested without a server.
+    _atomicswap_relay = None
+
+    @staticmethod
+    def _swap_relay():
+        if ElectrumX._atomicswap_relay is None:
+            ElectrumX._atomicswap_relay = SwapRelay.from_env()
+        return ElectrumX._atomicswap_relay
+
+    def _swap_client(self):
+        return str(self.remote_address().host)
 
     async def atomicswap_get_offers(self):
         """Return all active (non-expired) swap offers."""
-        now = time.time()
-        expired = [k for k, v in self._atomicswap_offers.items()
-                   if v.get('expires_at', 0) < now]
-        for k in expired:
-            del self._atomicswap_offers[k]
-            self._atomicswap_seen.discard(k)
-        return list(self._atomicswap_offers.values())
+        return self._swap_relay().get_offers()
 
     async def atomicswap_post_offer(self, offer, _gossip=True):
         """Post a new swap offer to the relay.
 
         If _gossip is True (default), the offer is also pushed to
-        peer servers. Peers should call with _gossip=False to prevent
-        infinite propagation loops.
+        peer servers. Peers call with _gossip=False to prevent
+        infinite propagation loops; those relayed copies never
+        overwrite an existing offer.
         """
         if not isinstance(offer, dict):
             raise RPCError(BAD_REQUEST, 'offer must be a dict')
@@ -1657,10 +1722,8 @@ class ElectrumX(SessionBase):
             if field not in offer:
                 raise RPCError(BAD_REQUEST, f'missing field: {field}')
 
-        # Dedup: if we've seen this offer before, don't re-gossip
-        is_new = offer_id not in self._atomicswap_seen
-        self._atomicswap_offers[offer_id] = offer
-        self._atomicswap_seen.add(offer_id)
+        is_new = self._swap_relay().post_offer(
+            offer, self._swap_client(), from_peer=not _gossip)
         self.logger.info(f'Atomic swap offer posted: {offer_id[:8]} '
                          f'(gossip={_gossip and is_new})')
 
@@ -1670,17 +1733,18 @@ class ElectrumX(SessionBase):
         return True
 
     async def atomicswap_cancel_offer(self, offer_id):
-        """Cancel/remove a swap offer."""
-        if offer_id in self._atomicswap_offers:
-            del self._atomicswap_offers[offer_id]
-            return True
-        return False
+        """Cancel/remove a swap offer. Only its poster may do this."""
+        try:
+            return self._swap_relay().cancel_offer(offer_id, self._swap_client())
+        except SwapRelayError as e:
+            raise RPCError(BAD_REQUEST, str(e))
 
     async def atomicswap_accept_offer(self, offer_id, acceptance):
         """Taker calls this to notify the maker they accepted an offer.
 
         Stores the taker's pubkey and BTC HTLC address so the maker's
-        wallet can poll and complete the swap setup.
+        wallet can poll and complete the swap setup. The first taker
+        wins; per-client limits apply (see atomicswap.py).
 
         acceptance = {
             'taker_pubkey': hex,
@@ -1695,13 +1759,70 @@ class ElectrumX(SessionBase):
         for field in required:
             if field not in acceptance:
                 raise RPCError(BAD_REQUEST, f'missing field: {field}')
-        self._atomicswap_acceptances[offer_id] = acceptance
+        try:
+            self._swap_relay().accept_offer(offer_id, acceptance, self._swap_client())
+        except SwapRelayError as e:
+            self.logger.info(f'Atomic swap accept refused for {offer_id[:8]}: {e}')
+            raise RPCError(BAD_REQUEST, str(e))
         self.logger.info(f'Atomic swap offer accepted: {offer_id[:8]}')
         return True
 
     async def atomicswap_get_acceptance(self, offer_id):
-        """Maker polls this to see if their offer was accepted."""
-        return self._atomicswap_acceptances.get(offer_id)
+        """Maker polls this to see if their offer was accepted.
+
+        The result includes 'taker_tag', an anonymous per-connection
+        identifier the maker can use for its own limits.
+        """
+        return self._swap_relay().get_acceptance(offer_id)
+
+    async def atomicswap_report_abandoned(self, offer_id):
+        """Maker reports that the taker never funded the BTC lockbox.
+
+        The taker's connection is then blocked from accepting offers for
+        ATOMICSWAP_BLOCK_HOURS. Only the offer's poster may report it.
+        """
+        try:
+            result = self._swap_relay().report_abandoned(offer_id, self._swap_client())
+        except SwapRelayError as e:
+            raise RPCError(BAD_REQUEST, str(e))
+        if result:
+            self.logger.info(f'Atomic swap acceptance abandoned: {offer_id[:8]}')
+        return result
+
+    async def atomicswap_features(self):
+        """What the relay supports: abuse controls and the watchtower."""
+        self.bump_cost(0.1)
+        return self.atomicswap_capabilities()
+
+    def _watchtower(self):
+        watchtower = self.session_mgr.watchtower
+        if watchtower is None:
+            raise RPCError(BAD_REQUEST, 'this server does not run a watchtower')
+        return watchtower
+
+    async def atomicswap_watch_register(self, package):
+        """Hand the watchtower pre-signed transactions to finish a swap.
+
+        The package carries a MARS claim (with a placeholder for the
+        secret) and BTC refunds, all signed by the wallet and paying only
+        the wallet. See electrumx/server/watchtower.py for the format.
+        Returns {'watch_id': hex, 'expires_at': unix seconds}.
+        """
+        self.bump_cost(5.0)
+        watchtower = self._watchtower()
+        tag = self._swap_relay().tag(self._swap_client())
+        try:
+            result = await watchtower.register(package, tag)
+        except WatchtowerError as e:
+            self.logger.info(f'Watchtower registration refused: {e}')
+            raise RPCError(BAD_REQUEST, str(e))
+        return result
+
+    async def atomicswap_watch_status(self, watch_id):
+        """Progress of a watch, or None if unknown. Never includes the
+        secret or the stored transactions."""
+        self.bump_cost(0.2)
+        return self._watchtower().status(watch_id)
 
     async def _gossip_offer_to_peers(self, offer):
         """Push an offer to all known good peer ElectrumX servers."""
