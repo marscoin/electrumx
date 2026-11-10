@@ -61,6 +61,12 @@ ALREADY_KNOWN = ('already in block chain', 'already in chain', 'already-in-mempo
                  'already in mempool', 'already-known', 'already known',
                  'already have transaction', 'outputs already in utxo set')
 FEE_TOO_LOW = ('min relay fee not met', 'mempool min fee not met')
+# A refund whose input the network does not have: the contract was never
+# funded, or its funding was replaced or spent some other way.
+MISSING_INPUTS = ('bad-txns-inputs-missingorspent', 'missing-inputs', 'missing inputs',
+                  'missingorspent')
+# How long every service must keep saying so before the watch is given up.
+ORPHAN_SECONDS = 3 * 3600
 
 
 class WatchtowerError(Exception):
@@ -1026,6 +1032,23 @@ class Watchtower:
             else:
                 replies.append(text[:200])
         changes = {'refund_start_height': start}
+        orphaned = (not accepted and len(replies) == len(self.esplora_urls)
+                    and all(_contains(r, MISSING_INPUTS) for r in replies))
+        if orphaned:
+            # Nothing to refund as far as any service can tell. Keep trying for
+            # a while (services lag, and a claim may yet show), then stop
+            # rather than resubmit a dead transaction for days.
+            since = record.get('refund_orphan_since')
+            now = int(self.clock())
+            if since is None:
+                changes['refund_orphan_since'] = now
+            elif now - since >= ORPHAN_SECONDS:
+                self._finish(record, FAILED,
+                             'the Bitcoin contract was never funded, or was spent before its refund',
+                             refund_start_height=start)
+                return
+        elif record.get('refund_orphan_since') is not None:
+            changes['refund_orphan_since'] = None
         if accepted:
             changes.update(state=REFUNDING, btc_refund_txid=refund_txid,
                            detail=f'BTC refund sent (fee step {index + 1} of {len(refunds)})')

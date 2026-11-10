@@ -849,6 +849,52 @@ def test_refund_posted_at_locktime_to_both_services(tower, http, mars):
     assert mars.broadcasts == []
 
 
+MISSING = (400, 'sendrawtransaction RPC error: {"code":-25,"message":"bad-txns-inputs-missingorspent"}')
+
+
+def test_gives_up_when_the_contract_never_appears(tower, http, mars, clock):
+    """A payment that was withdrawn, or never made, leaves nothing to refund.
+    The refund is retried for a while, then the watch ends instead of posting
+    a dead transaction every minute for days."""
+    register(tower)
+    set_tip(http, BTC_LOCKTIME)
+    http.post_reply = lambda base, body: MISSING
+    run(tower.tick())
+    assert tower.status(WATCH_ID)['state'] == 'watching'
+    clock.now += 2 * 3600
+    run(tower.tick())
+    assert tower.status(WATCH_ID)['state'] == 'watching'
+    clock.now += 3600
+    run(tower.tick())
+    status = tower.status(WATCH_ID)
+    assert status['state'] == 'failed'
+    assert 'never funded' in status['detail']
+    posts = len(http.posts)
+    run(tower.tick())
+    assert len(http.posts) == posts and mars.broadcasts == []
+
+
+def test_does_not_give_up_while_any_service_disagrees_or_is_silent(tower, http, clock):
+    register(tower)
+    set_tip(http, BTC_LOCKTIME)
+    # One service says the input is missing; the other fails for another reason.
+    http.post_reply = lambda base, body: MISSING if base == MEMPOOL else (503, 'Service Unavailable')
+    run(tower.tick())
+    clock.now += 6 * 3600
+    run(tower.tick())
+    assert tower.status(WATCH_ID)['state'] == 'watching'
+    # The count starts afresh once the missing-input answers are unanimous.
+    http.post_reply = lambda base, body: MISSING
+    run(tower.tick())
+    clock.now += 3600
+    run(tower.tick())
+    assert tower.status(WATCH_ID)['state'] == 'watching'
+    # An accepted refund ends any doubt.
+    http.post_reply = None
+    run(tower.tick())
+    assert tower.status(WATCH_ID)['state'] == 'refunding'
+
+
 def test_tip_is_the_highest_answer(tower, http):
     register(tower)
     http.tip = {MEMPOOL: None, BLOCKSTREAM: BTC_LOCKTIME - 1}
