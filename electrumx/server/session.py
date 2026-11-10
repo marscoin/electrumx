@@ -37,6 +37,9 @@ from electrumx.lib.text import sessions_lines
 from electrumx.server.atomicswap import SwapRelay, SwapRelayError
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
+from electrumx.server.watchtower import (PROTOCOL_VERSION as WATCHTOWER_VERSION,
+                                         Watchtower, WatchtowerError)
+from electrumx.server.watchtower import enabled_from_env as watchtower_enabled
 
 if TYPE_CHECKING:
     from electrumx.server.db import DB
@@ -164,6 +167,8 @@ class SessionManager:
         # Event triggered when electrumx is listening for incoming requests.
         self.server_listening = Event()
         self.session_event = Event()
+        # Atomic swap watchtower; created in serve() if enabled
+        self.watchtower = None
 
         # Set up the RPC request handlers
         cmds = ('add_peer daemon_url disconnect getinfo groups log peers '
@@ -633,7 +638,10 @@ class SessionManager:
             await self._start_external_servers()
             # Peer discovery should start after the external servers
             # because we connect to ourself
+            self._start_watchtower()
             async with self._task_group as group:
+                if self.watchtower is not None:
+                    await group.spawn(self.watchtower.run())
                 await group.spawn(self.peer_mgr.discover_peers())
                 await group.spawn(self._clear_stale_sessions())
                 await group.spawn(self._handle_chain_reorgs())
@@ -751,6 +759,45 @@ class SessionManager:
         hex_hash = await self.daemon.broadcast_transaction(raw_tx)
         self.txs_sent += 1
         return hex_hash
+
+    # --- Atomic swap watchtower (see electrumx/server/watchtower.py)
+
+    def _start_watchtower(self):
+        '''Open the watchtower and its stored watches. A failure here must
+        not stop the server; the watchtower is then simply unavailable.'''
+        if not watchtower_enabled():
+            self.logger.info('atomic swap watchtower disabled (WATCHTOWER_ENABLED)')
+            return
+        try:
+            self.watchtower = Watchtower.from_env(
+                self.env.db_dir,
+                broadcast_mars=self.broadcast_transaction,
+                mars_raw_tx=self._watchtower_raw_tx,
+                mars_confirmations=self._watchtower_confirmations,
+                mars_height=lambda: self.db.db_height,
+                logger=self.logger,
+            )
+        except Exception:
+            self.logger.exception('atomic swap watchtower could not start')
+            return
+        self.logger.info(f'atomic swap watchtower state: {self.watchtower.store.path}')
+
+    async def _watchtower_raw_tx(self, tx_hash):
+        '''Raw tx hex from the daemon, or None if it does not know the tx.'''
+        try:
+            return await self.daemon.getrawtransaction(tx_hash, False)
+        except DaemonError as e:
+            error = e.args[0] if e.args else None
+            if isinstance(error, dict) and error.get('code') == -5:
+                return None
+            raise
+
+    async def _watchtower_confirmations(self, tx_hash):
+        try:
+            tx = await self.daemon.getrawtransaction(tx_hash, True)
+        except DaemonError:
+            return 0
+        return int(tx.get('confirmations') or 0) if isinstance(tx, dict) else 0
 
     async def limited_history(self, hashX):
         '''Returns a pair (history, cost).
@@ -979,6 +1026,16 @@ class ElectrumX(SessionBase):
             'genesis_hash': env.coin.GENESIS_HASH,
             'hash_function': 'sha256',
             'services': [str(service) for service in env.report_services],
+            'atomicswap': cls.atomicswap_capabilities(),
+        }
+
+    @staticmethod
+    def atomicswap_capabilities():
+        '''What this server's atomic swap relay supports.'''
+        return {
+            'abuse_controls': True,
+            'watchtower': watchtower_enabled(),
+            'watchtower_version': WATCHTOWER_VERSION,
         }
 
     async def server_features_async(self):
@@ -1608,6 +1665,9 @@ class ElectrumX(SessionBase):
         handlers['atomicswap.accept_offer'] = self.atomicswap_accept_offer
         handlers['atomicswap.get_acceptance'] = self.atomicswap_get_acceptance
         handlers['atomicswap.report_abandoned'] = self.atomicswap_report_abandoned
+        handlers['atomicswap.features'] = self.atomicswap_features
+        handlers['atomicswap.watch_register'] = self.atomicswap_watch_register
+        handlers['atomicswap.watch_status'] = self.atomicswap_watch_status
 
         # Self-healing address repair (Electrum-Mars extension)
         handlers['blockchain.scripthash.repair'] = self.blockchain_scripthash_repair
@@ -1728,6 +1788,41 @@ class ElectrumX(SessionBase):
         if result:
             self.logger.info(f'Atomic swap acceptance abandoned: {offer_id[:8]}')
         return result
+
+    async def atomicswap_features(self):
+        """What the relay supports: abuse controls and the watchtower."""
+        self.bump_cost(0.1)
+        return self.atomicswap_capabilities()
+
+    def _watchtower(self):
+        watchtower = self.session_mgr.watchtower
+        if watchtower is None:
+            raise RPCError(BAD_REQUEST, 'this server does not run a watchtower')
+        return watchtower
+
+    async def atomicswap_watch_register(self, package):
+        """Hand the watchtower pre-signed transactions to finish a swap.
+
+        The package carries a MARS claim (with a placeholder for the
+        secret) and BTC refunds, all signed by the wallet and paying only
+        the wallet. See electrumx/server/watchtower.py for the format.
+        Returns {'watch_id': hex, 'expires_at': unix seconds}.
+        """
+        self.bump_cost(5.0)
+        watchtower = self._watchtower()
+        tag = self._swap_relay().tag(self._swap_client())
+        try:
+            result = await watchtower.register(package, tag)
+        except WatchtowerError as e:
+            self.logger.info(f'Watchtower registration refused: {e}')
+            raise RPCError(BAD_REQUEST, str(e))
+        return result
+
+    async def atomicswap_watch_status(self, watch_id):
+        """Progress of a watch, or None if unknown. Never includes the
+        secret or the stored transactions."""
+        self.bump_cost(0.2)
+        return self._watchtower().status(watch_id)
 
     async def _gossip_offer_to_peers(self, offer):
         """Push an offer to all known good peer ElectrumX servers."""
